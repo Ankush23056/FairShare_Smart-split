@@ -2,7 +2,7 @@
 
 🔗 **Live Demo:** [https://fairsharre.netlify.app/](https://fairsharre.netlify.app/)
 
-💻 **Github:** [https://github.com/Ankush23056/FairShare-Shared-Expense](https://github.com/Ankush23056/FairShare-Shared-Expense)
+💻 **Github:** [https://github.com/Ankush23056/FairShare_Smart-split.git](https://github.com/Ankush23056/FairShare_Smart-split.git)
 
 FairShare is a full-stack web application designed to simplify the process of tracking and settling shared expenses among friends or roommates. This project focuses on managing complex data relationships and providing a seamless user experience for financial transparency.
 
