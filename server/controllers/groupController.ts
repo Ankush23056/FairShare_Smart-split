@@ -1,23 +1,31 @@
 import { Request, Response } from 'express';
 import { getDb } from '../db';
+import { randomUUID } from 'crypto';
 
 export const getGroups = async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const userId = (req as any).user?.id;
-    
+
+    // Get all groups where user is a member
     const [groups] = await db.query<any[]>(`
-      SELECT g.*, 
-             (SELECT SUM(amount) FROM expenses WHERE group_id = g.id) as totalAmount
+      SELECT g.*,
+             (SELECT SUM(amount) FROM expenses WHERE groupId = g.id) as totalAmount
       FROM groups_table g
-      JOIN group_members gm ON g.id = gm.group_id
-      WHERE gm.user_id = ?
+      JOIN group_members gm ON g.id = gm.groupId
+      WHERE gm.userId = ?
     `, [userId]);
 
+    // For each group, fetch members with their names from users table
     for (const group of groups) {
-      const [members] = await db.query<any[]>('SELECT user_id as id, name FROM group_members WHERE group_id = ?', [group.id]);
+      const [members] = await db.query<any[]>(`
+        SELECT u.id, u.name
+        FROM group_members gm
+        JOIN users u ON u.id = gm.userId
+        WHERE gm.groupId = ?
+      `, [group.id]);
       group.members = members;
-      group.totalAmount = group.totalAmount || 0;
+      group.totalAmount = Number(group.totalAmount) || 0;
     }
 
     res.json(groups);
@@ -31,21 +39,31 @@ export const createGroup = async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const { name, description, members } = req.body;
-    const newGroupId = String(Date.now());
-    
+    const newGroupId = randomUUID();
+    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
     await db.query(
-      'INSERT INTO groups_table (id, name, description, totalAmount) VALUES (?, ?, ?, ?)',
-      [newGroupId, name, description, 0]
+      'INSERT INTO groups_table (id, name, createdAt, updatedAt) VALUES (?, ?, ?, ?)',
+      [newGroupId, name, now, now]
     );
 
     for (const member of members) {
+      const memberId = randomUUID();
       await db.query(
-        'INSERT INTO group_members (group_id, user_id, name) VALUES (?, ?, ?)',
-        [newGroupId, member.id, member.name]
+        'INSERT INTO group_members (id, groupId, userId, joinedAt) VALUES (?, ?, ?, ?)',
+        [memberId, newGroupId, member.id, now]
       );
     }
 
-    res.status(201).json({ id: newGroupId, name, description, totalAmount: 0, members });
+    // Fetch member details to return proper names
+    const [memberDetails] = await db.query<any[]>(`
+      SELECT u.id, u.name
+      FROM group_members gm
+      JOIN users u ON u.id = gm.userId
+      WHERE gm.groupId = ?
+    `, [newGroupId]);
+
+    res.status(201).json({ id: newGroupId, name, description, totalAmount: 0, members: memberDetails });
   } catch (error: any) {
     console.error('createGroup error:', error);
     res.status(500).json({ error: error.message || 'Server error' });
@@ -57,19 +75,24 @@ export const getGroupById = async (req: Request, res: Response) => {
     const db = await getDb();
     const userId = (req as any).user?.id;
     const groupId = req.params.id;
-    
+
     const [groups] = await db.query<any[]>('SELECT * FROM groups_table WHERE id = ?', [groupId]);
     const group = groups[0];
-    
     if (!group) return res.status(404).json({ error: 'Group not found' });
-    
-    const [members] = await db.query<any[]>('SELECT user_id as id, name FROM group_members WHERE group_id = ?', [groupId]);
+
+    const [members] = await db.query<any[]>(`
+      SELECT u.id, u.name
+      FROM group_members gm
+      JOIN users u ON u.id = gm.userId
+      WHERE gm.groupId = ?
+    `, [groupId]);
+
     const isMember = members.some(m => m.id === userId);
     if (!isMember) return res.status(403).json({ error: 'Access denied' });
-    
-    const [expenses] = await db.query<any[]>('SELECT SUM(amount) as total FROM expenses WHERE group_id = ?', [groupId]);
-    
-    res.json({ ...group, members, totalAmount: expenses[0]?.total || 0 });
+
+    const [totals] = await db.query<any[]>('SELECT SUM(amount) as total FROM expenses WHERE groupId = ?', [groupId]);
+
+    res.json({ ...group, members, totalAmount: Number(totals[0]?.total) || 0 });
   } catch (error: any) {
     console.error('getGroupById error:', error);
     res.status(500).json({ error: error.message || 'Server error' });
@@ -80,23 +103,38 @@ export const getGroupAnalytics = async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const groupId = req.params.id;
-    
-    // For now, we'll keep the mock analytics data, but in a real app
-    // we would query the expenses table to calculate these metrics
+
+    // Real spending by category
+    const [byCategory] = await db.query<any[]>(`
+      SELECT category as name, SUM(amount) as value
+      FROM expenses WHERE groupId = ? AND category IS NOT NULL
+      GROUP BY category ORDER BY value DESC
+    `, [groupId]);
+
+    const [totals] = await db.query<any[]>('SELECT SUM(amount) as total FROM expenses WHERE groupId = ?', [groupId]);
+    const totalSpent = Number(totals[0]?.total) || 0;
+
+    // Top spender
+    const [topSpenders] = await db.query<any[]>(`
+      SELECT u.name, SUM(e.amount) as amount
+      FROM expenses e JOIN users u ON u.id = e.paidById
+      WHERE e.groupId = ?
+      GROUP BY e.paidById, u.name ORDER BY amount DESC LIMIT 1
+    `, [groupId]);
+
+    // Spending trends (by date)
+    const [trends] = await db.query<any[]>(`
+      SELECT DATE(date) as date, SUM(amount) as amount
+      FROM expenses WHERE groupId = ?
+      GROUP BY DATE(date) ORDER BY date
+    `, [groupId]);
+
     res.json({
-      totalSpent: 15800,
-      topSpender: { name: 'Ankush', amount: 8000 },
-      mostExpensiveCategory: 'Travel',
-      spendingByCategory: [
-        { name: 'Food', value: 4000 },
-        { name: 'Travel', value: 8000 },
-        { name: 'Accommodation', value: 3800 }
-      ],
-      spendingTrends: [
-        { date: '2023-10-01', amount: 2000 },
-        { date: '2023-10-02', amount: 5000 },
-        { date: '2023-10-03', amount: 8800 }
-      ]
+      totalSpent,
+      topSpender: topSpenders[0] ? { name: topSpenders[0].name, amount: Number(topSpenders[0].amount) } : null,
+      mostExpensiveCategory: byCategory[0]?.name || null,
+      spendingByCategory: byCategory.map(r => ({ name: r.name, value: Number(r.value) })),
+      spendingTrends: trends.map(r => ({ date: String(r.date).slice(0, 10), amount: Number(r.amount) })),
     });
   } catch (error: any) {
     console.error('getGroupAnalytics error:', error);

@@ -1,19 +1,23 @@
 import { Request, Response } from 'express';
 import { simplifyDebts } from '../utils/simplifyDebts';
 import { getDb } from '../db';
+import { randomUUID } from 'crypto';
 
 export const getExpenses = async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const groupId = req.params.groupId;
-    
-    const [expenses] = await db.query<any[]>('SELECT * FROM expenses WHERE group_id = ?', [groupId]);
-    
+
+    const [expenses] = await db.query<any[]>('SELECT * FROM expenses WHERE groupId = ?', [groupId]);
+
     for (const expense of expenses) {
-      const [splits] = await db.query<any[]>('SELECT user_id as userId, amount FROM expense_splits WHERE expense_id = ?', [expense.id]);
+      const [splits] = await db.query<any[]>(
+        'SELECT userId, amount FROM expense_splits WHERE expenseId = ?',
+        [expense.id]
+      );
       expense.splits = splits;
     }
-    
+
     res.json(expenses);
   } catch (error: any) {
     console.error('getExpenses error:', error);
@@ -26,21 +30,23 @@ export const createExpense = async (req: Request, res: Response) => {
     const db = await getDb();
     const groupId = req.params.groupId;
     const { description, amount, paidBy, category, splits } = req.body;
-    
-    const newExpenseId = String(Date.now());
-    
+
+    const newExpenseId = randomUUID();
+    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
     await db.query(
-      'INSERT INTO expenses (id, group_id, description, amount, paid_by, category) VALUES (?, ?, ?, ?, ?, ?)',
-      [newExpenseId, groupId, description, amount, paidBy, category]
+      'INSERT INTO expenses (id, groupId, description, amount, paidById, category, date, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [newExpenseId, groupId, description, amount, paidBy, category, now, now]
     );
 
     for (const split of splits) {
+      const splitId = randomUUID();
       await db.query(
-        'INSERT INTO expense_splits (expense_id, user_id, amount) VALUES (?, ?, ?)',
-        [newExpenseId, split.userId, split.amount]
+        'INSERT INTO expense_splits (id, expenseId, userId, amount) VALUES (?, ?, ?, ?)',
+        [splitId, newExpenseId, split.userId, split.amount]
       );
     }
-    
+
     res.status(201).json({ id: newExpenseId, description, amount, paidBy, category, splits });
   } catch (error: any) {
     console.error('createExpense error:', error);
@@ -51,17 +57,16 @@ export const createExpense = async (req: Request, res: Response) => {
 export const createSettlement = async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const groupId = req.params.groupId;
     const { payerId, payeeId, amount } = req.body;
-    
-    const newSettlementId = String(Date.now());
-    const date = new Date().toISOString().slice(0, 19).replace('T', ' '); // MySQL format
-    
+
+    const newSettlementId = randomUUID();
+    const date = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
     await db.query(
-      'INSERT INTO settlements (id, group_id, payer_id, payee_id, amount, date) VALUES (?, ?, ?, ?, ?, ?)',
-      [newSettlementId, groupId, payerId, payeeId, amount, date]
+      'INSERT INTO settlements (id, payerId, payeeId, amount, date) VALUES (?, ?, ?, ?, ?)',
+      [newSettlementId, payerId, payeeId, amount, date]
     );
-    
+
     res.status(201).json({ id: newSettlementId, payerId, payeeId, amount, date });
   } catch (error: any) {
     console.error('createSettlement error:', error);
@@ -73,42 +78,59 @@ export const getBalances = async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const groupId = req.params.groupId;
-    
-    const [expenses] = await db.query<any[]>('SELECT * FROM expenses WHERE group_id = ?', [groupId]);
-    const [settlements] = await db.query<any[]>('SELECT * FROM settlements WHERE group_id = ?', [groupId]);
-    
+
+    const [expenses] = await db.query<any[]>('SELECT * FROM expenses WHERE groupId = ?', [groupId]);
+
+    // Fetch members of the group for settlements filtering
+    const [members] = await db.query<any[]>('SELECT userId FROM group_members WHERE groupId = ?', [groupId]);
+    const memberIds = members.map((m: any) => m.userId);
+
+    // Only fetch settlements between members of this group
+    let settlements: any[] = [];
+    if (memberIds.length >= 2) {
+      const placeholders = memberIds.map(() => '?').join(',');
+      const [rows] = await db.query<any[]>(
+        `SELECT * FROM settlements WHERE payerId IN (${placeholders}) AND payeeId IN (${placeholders})`,
+        [...memberIds, ...memberIds]
+      );
+      settlements = rows;
+    }
+
     // Calculate net balances
     const balances: Record<string, number> = {};
-    
+
     for (const exp of expenses) {
-      // Person who paid gets positive balance
-      balances[exp.paid_by] = (balances[exp.paid_by] || 0) + Number(exp.amount);
-      
-      const [splits] = await db.query<any[]>('SELECT user_id as userId, amount FROM expense_splits WHERE expense_id = ?', [exp.id]);
-      
-      // Everyone who owes gets negative balance
+      // Person who paid gets positive balance (they are owed)
+      balances[exp.paidById] = (balances[exp.paidById] || 0) + Number(exp.amount);
+
+      const [splits] = await db.query<any[]>(
+        'SELECT userId, amount FROM expense_splits WHERE expenseId = ?',
+        [exp.id]
+      );
+
+      // Everyone in splits owes their share (negative)
       for (const split of splits) {
         balances[split.userId] = (balances[split.userId] || 0) - Number(split.amount);
       }
     }
-    
+
     for (const settlement of settlements) {
-      balances[settlement.payer_id] = (balances[settlement.payer_id] || 0) + Number(settlement.amount);
-      balances[settlement.payee_id] = (balances[settlement.payee_id] || 0) - Number(settlement.amount);
+      // Payer reduces what they owe (positive effect for payer)
+      balances[settlement.payerId] = (balances[settlement.payerId] || 0) + Number(settlement.amount);
+      // Payee receives less (reduces what they are owed)
+      balances[settlement.payeeId] = (balances[settlement.payeeId] || 0) - Number(settlement.amount);
     }
-    
-    // Simplify debts
+
     const simplifiedDebts = simplifyDebts(balances);
-    
-    // Format settlements for frontend
+
     const formattedSettlements = settlements.map(s => ({
       id: s.id,
-      payerId: s.payer_id,
-      payeeId: s.payee_id,
+      payerId: s.payerId,
+      payeeId: s.payeeId,
       amount: Number(s.amount),
-      date: s.date
+      date: s.date,
     }));
-    
+
     res.json({ balances, simplifiedDebts, settlements: formattedSettlements });
   } catch (error: any) {
     console.error('getBalances error:', error);
